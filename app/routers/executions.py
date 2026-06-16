@@ -1,4 +1,5 @@
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -6,12 +7,14 @@ from app.database import get_db
 from app.models import (
     Execution, ExecutionItem, ChecklistTemplate, TemplateItem,
     NonConformance, ScoreRevision, AuditLog, generate_batch_no,
+    NCEscalationRule,
 )
 from app.schemas import (
     ExecutionCreate, ExecutionOut, ExecutionItemScore,
     BatchScoreRequest, NonConformanceCreate, NonConformanceOut,
     NonConformanceEscalate, ScoreModifyRequest, ScoreRevisionOut,
-    ForceCompleteRequest, ReopenRequest,
+    ForceCompleteRequest, ReopenRequest, SuspendRequest, TerminateRequest,
+    ScoreReplayRequest, NCEscalationRuleCreate, NCEscalationRuleOut,
 )
 
 router = APIRouter(prefix="/api/executions", tags=["执行记录"])
@@ -91,6 +94,44 @@ def list_executions(
     return q.order_by(Execution.created_at.desc()).offset(skip).limit(limit).all()
 
 
+@router.post("/escalation-rules", response_model=NCEscalationRuleOut)
+def create_escalation_rule(data: NCEscalationRuleCreate, db: Session = Depends(get_db)):
+    if data.from_severity not in SEVERITY_LADDER:
+        raise HTTPException(status_code=400, detail=f"from_severity 无效，可选: {SEVERITY_LADDER}")
+    if data.to_severity not in SEVERITY_LADDER:
+        raise HTTPException(status_code=400, detail=f"to_severity 无效，可选: {SEVERITY_LADDER}")
+    if SEVERITY_LADDER.index(data.to_severity) <= SEVERITY_LADDER.index(data.from_severity):
+        raise HTTPException(status_code=400, detail="to_severity 必须比 from_severity 更严重")
+    rule = NCEscalationRule(
+        product_line_id=data.product_line_id,
+        trigger_type=data.trigger_type,
+        trigger_value=data.trigger_value,
+        from_severity=data.from_severity,
+        to_severity=data.to_severity,
+        window_days=data.window_days,
+        rule_name=data.rule_name or f"{data.from_severity}->{data.to_severity}",
+        created_by=data.created_by,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@router.get("/escalation-rules", response_model=list[NCEscalationRuleOut])
+def list_escalation_rules(
+    product_line_id: int | None = None,
+    is_active: int | None = None,
+    db: Session = Depends(get_db),
+):
+    q = db.query(NCEscalationRule)
+    if product_line_id is not None:
+        q = q.filter(NCEscalationRule.product_line_id == product_line_id)
+    if is_active is not None:
+        q = q.filter(NCEscalationRule.is_active == is_active)
+    return q.order_by(NCEscalationRule.created_at.desc()).all()
+
+
 @router.post("/nonconformances", response_model=NonConformanceOut)
 def create_nonconformance(data: NonConformanceCreate, db: Session = Depends(get_db)):
     ei = db.query(ExecutionItem).filter(ExecutionItem.id == data.execution_item_id).first()
@@ -113,7 +154,72 @@ def create_nonconformance(data: NonConformanceCreate, db: Session = Depends(get_
     _log(db, data.created_by, "create_nc", "nonconformance", 0, data.description[:100])
     db.commit()
     db.refresh(nc)
+    _auto_check_escalation_rules(db, nc)
+    db.refresh(nc)
     return nc
+
+
+def _auto_check_escalation_rules(db: Session, new_nc: NonConformance):
+    ei = db.query(ExecutionItem).filter(ExecutionItem.id == new_nc.execution_item_id).first()
+    if not ei:
+        return
+    execution = db.query(Execution).filter(Execution.id == ei.execution_id).first()
+    if not execution:
+        return
+    rules = db.query(NCEscalationRule).filter(
+        NCEscalationRule.is_active == 1,
+        (NCEscalationRule.product_line_id == None) | (
+            NCEscalationRule.product_line_id == execution.product_line_id),
+        NCEscalationRule.from_severity == new_nc.severity,
+    ).all()
+    if not rules:
+        return
+    now = datetime.utcnow()
+    tpl_item = db.query(TemplateItem).filter(TemplateItem.id == ei.template_item_id).first()
+    item_name = tpl_item.name if tpl_item else ""
+    for rule in rules:
+        if rule.trigger_type == "recurring_count":
+            window_start = now - timedelta(days=rule.window_days)
+            same_item_nc_count = (
+                db.query(NonConformance)
+                .join(ExecutionItem, NonConformance.execution_item_id == ExecutionItem.id)
+                .join(Execution, ExecutionItem.execution_id == Execution.id)
+                .filter(
+                    ExecutionItem.template_item_id == ei.template_item_id,
+                    Execution.product_line_id == execution.product_line_id,
+                    NonConformance.severity == new_nc.severity,
+                    NonConformance.created_at >= window_start,
+                )
+                .count()
+            )
+            if same_item_nc_count >= rule.trigger_value:
+                _do_auto_escalate(db, new_nc, rule, "system",
+                                  f"[{rule.rule_name}] 规则触发，同项累计 {same_item_nc_count} 次")
+                break
+
+
+def _do_auto_escalate(db: Session, nc: NonConformance, rule: NCEscalationRule, created_by: str, reason: str):
+    current_idx = SEVERITY_LADDER.index(nc.severity) if nc.severity in SEVERITY_LADDER else -1
+    if current_idx >= len(SEVERITY_LADDER) - 1:
+        return None
+    new_severity = rule.to_severity
+    now = datetime.utcnow()
+    new_nc = NonConformance(
+        execution_item_id=nc.execution_item_id,
+        description=f"[规则自动升级自NC#{nc.id}] {reason}",
+        severity=new_severity,
+        disposition=nc.disposition,
+        escalation_level=current_idx + 2,
+        escalated_from_id=nc.id,
+        escalated_at=now,
+        created_by=created_by,
+    )
+    db.add(new_nc)
+    db.flush()
+    _log(db, created_by, "auto_escalate_nc", "nonconformance", nc.id, f"{nc.severity}->{new_severity}")
+    db.commit()
+    db.refresh(new_nc)
+    return new_nc
 
 
 @router.post("/nonconformances/{nc_id}/escalate", response_model=NonConformanceOut)
@@ -210,6 +316,7 @@ def batch_score(execution_id: int, data: BatchScoreRequest, db: Session = Depend
     if execution.status != "in_progress":
         raise HTTPException(status_code=400, detail="只有进行中的执行记录才能打分")
     now = datetime.utcnow()
+    group_id = uuid.uuid4().hex[:12]
     for item_score in data.items:
         ei = (
             db.query(ExecutionItem)
@@ -227,11 +334,13 @@ def batch_score(execution_id: int, data: BatchScoreRequest, db: Session = Depend
         if ei.result not in ("pending", "") and ei.scored_by:
             rev = ScoreRevision(
                 execution_item_id=ei.id,
+                execution_id=execution_id,
                 old_score=ei.score, new_score=item_score.score,
                 old_result=ei.result, new_result=item_score.result,
                 old_remark=ei.remark or "", new_remark=item_score.remark,
                 old_max_score=ei.max_score, new_max_score=item_score.max_score,
                 changed_by=item_score.scored_by, reason="首次打分覆盖",
+                revision_group=group_id,
             )
             db.add(rev)
         ei.score = item_score.score
@@ -253,9 +362,10 @@ def modify_scores(execution_id: int, data: ScoreModifyRequest, db: Session = Dep
     execution = db.query(Execution).filter(Execution.id == execution_id).first()
     if not execution:
         raise HTTPException(status_code=404, detail="执行记录不存在")
-    if execution.status not in ("completed", "arbitrated"):
-        raise HTTPException(status_code=400, detail="只有已完成或已仲裁的执行记录才能修改打分")
+    if execution.status not in ("completed", "arbitrated", "in_progress"):
+        raise HTTPException(status_code=400, detail="当前状态不允许修改打分")
     now = datetime.utcnow()
+    group_id = uuid.uuid4().hex[:12]
     for item_score in data.items:
         ei = (
             db.query(ExecutionItem)
@@ -274,11 +384,17 @@ def modify_scores(execution_id: int, data: ScoreModifyRequest, db: Session = Dep
             raise HTTPException(status_code=400, detail="未打分的检查项请用打分接口，不能用修改接口")
         rev = ScoreRevision(
             execution_item_id=ei.id,
+            execution_id=execution_id,
             old_score=ei.score, new_score=item_score.score,
             old_result=ei.result, new_result=item_score.result,
             old_remark=ei.remark or "", new_remark=item_score.remark,
             old_max_score=ei.max_score, new_max_score=item_score.max_score,
             changed_by=data.changed_by, reason=data.reason,
+            revision_group=group_id,
+            snapshot={
+                "score": ei.score, "result": ei.result, "remark": ei.remark,
+                "max_score": ei.max_score, "scored_by": ei.scored_by,
+            },
         )
         db.add(rev)
         ei.score = item_score.score
@@ -290,7 +406,86 @@ def modify_scores(execution_id: int, data: ScoreModifyRequest, db: Session = Dep
     all_items = db.query(ExecutionItem).filter(ExecutionItem.execution_id == execution_id).all()
     execution.total_score = sum(i.score for i in all_items)
     execution.max_score = sum(i.max_score for i in all_items)
+    db.flush()
+    last_rev = (
+        db.query(ScoreRevision).filter(ScoreRevision.execution_id == execution_id)
+        .order_by(ScoreRevision.changed_at.desc()).first()
+    )
+    if last_rev:
+        execution.last_revision_id = last_rev.id
     _log(db, data.changed_by, "modify_scores", "execution", execution_id, data.reason)
+    db.commit()
+    db.refresh(execution)
+    return execution
+
+
+@router.post("/{execution_id}/score-replay", response_model=ExecutionOut)
+def replay_score_revisions(execution_id: int, data: ScoreReplayRequest, db: Session = Depends(get_db)):
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if execution.status == "terminated":
+        raise HTTPException(status_code=400, detail="已终止的执行记录不能回放")
+    if data.revision_ids:
+        revisions = (
+            db.query(ScoreRevision)
+            .filter(
+                ScoreRevision.id.in_(data.revision_ids),
+                ScoreRevision.execution_id == execution_id,
+            )
+            .order_by(ScoreRevision.changed_at.asc())
+            .all()
+        )
+    elif data.revision_group:
+        revisions = (
+            db.query(ScoreRevision)
+            .filter(
+                ScoreRevision.revision_group == data.revision_group,
+                ScoreRevision.execution_id == execution_id,
+            )
+            .order_by(ScoreRevision.changed_at.asc())
+            .all()
+        )
+    else:
+        raise HTTPException(status_code=400, detail="必须指定 revision_ids 或 revision_group")
+    if not revisions:
+        raise HTTPException(status_code=404, detail="未找到匹配的修订记录")
+    now = datetime.utcnow()
+    group_id = uuid.uuid4().hex[:12]
+    for rev in revisions:
+        ei = db.query(ExecutionItem).filter(ExecutionItem.id == rev.execution_item_id).first()
+        if not ei:
+            continue
+        if ei.execution_id != execution_id:
+            continue
+        rollback_rev = ScoreRevision(
+            execution_item_id=ei.id,
+            execution_id=execution_id,
+            old_score=ei.score, new_score=rev.old_score,
+            old_result=ei.result, new_result=rev.old_result,
+            old_remark=ei.remark or "", new_remark=rev.old_remark,
+            old_max_score=ei.max_score, new_max_score=rev.old_max_score,
+            changed_by=data.operated_by,
+            reason=f"[回放REV#{rev.id}] {data.reason}",
+            revision_group=group_id,
+            snapshot={
+                "replayed_revision_id": rev.id,
+                "original_changed_by": rev.changed_by,
+                "original_reason": rev.reason,
+            },
+        )
+        db.add(rollback_rev)
+        ei.score = rev.old_score
+        ei.max_score = rev.old_max_score
+        ei.result = rev.old_result
+        ei.remark = rev.old_remark
+        ei.scored_by = rev.changed_by
+        ei.scored_at = now
+    all_items = db.query(ExecutionItem).filter(ExecutionItem.execution_id == execution_id).all()
+    execution.total_score = sum(i.score for i in all_items)
+    execution.max_score = sum(i.max_score for i in all_items)
+    _log(db, data.operated_by, "replay_scores", "execution", execution_id,
+         f"revs={[r.id for r in revisions]}")
     db.commit()
     db.refresh(execution)
     return execution
@@ -301,10 +496,12 @@ def list_score_revisions(execution_id: int, db: Session = Depends(get_db)):
     execution = db.query(Execution).filter(Execution.id == execution_id).first()
     if not execution:
         raise HTTPException(status_code=404, detail="执行记录不存在")
-    ei_ids = [ei.id for ei in execution.execution_items]
-    if not ei_ids:
-        return []
-    return db.query(ScoreRevision).filter(ScoreRevision.execution_item_id.in_(ei_ids)).order_by(ScoreRevision.changed_at.desc()).all()
+    return (
+        db.query(ScoreRevision)
+        .filter(ScoreRevision.execution_id == execution_id)
+        .order_by(ScoreRevision.changed_at.desc())
+        .all()
+    )
 
 
 @router.post("/{execution_id}/complete", response_model=ExecutionOut)
@@ -342,12 +539,63 @@ def force_complete_execution(execution_id: int, data: ForceCompleteRequest, db: 
     return execution
 
 
+@router.post("/{execution_id}/suspend", response_model=ExecutionOut)
+def suspend_execution(execution_id: int, data: SuspendRequest, db: Session = Depends(get_db)):
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if execution.status != "in_progress":
+        raise HTTPException(status_code=400, detail="只有进行中的执行记录才能暂停")
+    execution.status = "suspended"
+    execution.suspended_by = data.operated_by
+    execution.suspended_at = datetime.utcnow()
+    execution.suspend_reason = data.reason
+    _log(db, data.operated_by, "suspend_execution", "execution", execution_id, data.reason)
+    db.commit()
+    db.refresh(execution)
+    return execution
+
+
+@router.post("/{execution_id}/resume", response_model=ExecutionOut)
+def resume_execution(execution_id: int, operated_by: str = "", reason: str = "", db: Session = Depends(get_db)):
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if execution.status != "suspended":
+        raise HTTPException(status_code=400, detail="只有暂停状态的执行记录才能恢复")
+    execution.status = "in_progress"
+    execution.suspended_by = ""
+    execution.suspended_at = None
+    execution.suspend_reason = ""
+    _log(db, operated_by, "resume_execution", "execution", execution_id, reason)
+    db.commit()
+    db.refresh(execution)
+    return execution
+
+
+@router.post("/{execution_id}/terminate", response_model=ExecutionOut)
+def terminate_execution(execution_id: int, data: TerminateRequest, db: Session = Depends(get_db)):
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if execution.status in ("terminated", "cancelled"):
+        raise HTTPException(status_code=400, detail="当前状态不允许终止")
+    execution.status = "terminated"
+    execution.terminated_by = data.operated_by
+    execution.terminated_at = datetime.utcnow()
+    execution.terminate_reason = data.reason
+    _log(db, data.operated_by, "terminate_execution", "execution", execution_id, data.reason)
+    db.commit()
+    db.refresh(execution)
+    return execution
+
+
 @router.post("/{execution_id}/reopen", response_model=ExecutionOut)
 def reopen_execution(execution_id: int, data: ReopenRequest, db: Session = Depends(get_db)):
     execution = db.query(Execution).filter(Execution.id == execution_id).first()
     if not execution:
         raise HTTPException(status_code=404, detail="执行记录不存在")
-    if execution.status not in ("completed", "cancelled", "arbitrated"):
+    if execution.status not in ("completed", "cancelled", "arbitrated", "suspended", "terminated"):
         raise HTTPException(status_code=400, detail="当前状态不允许重新打开")
     execution.status = "in_progress"
     execution.arbitration_result = None
@@ -355,6 +603,12 @@ def reopen_execution(execution_id: int, data: ReopenRequest, db: Session = Depen
     execution.arbitration_at = None
     execution.arbitration_comment = ""
     execution.force_completed = 0
+    execution.suspended_by = ""
+    execution.suspended_at = None
+    execution.suspend_reason = ""
+    execution.terminated_by = ""
+    execution.terminated_at = None
+    execution.terminate_reason = ""
     _log(db, data.operated_by, "reopen_execution", "execution", execution_id, data.reason)
     db.commit()
     db.refresh(execution)
@@ -366,7 +620,7 @@ def cancel_execution(execution_id: int, db: Session = Depends(get_db)):
     execution = db.query(Execution).filter(Execution.id == execution_id).first()
     if not execution:
         raise HTTPException(status_code=404, detail="执行记录不存在")
-    if execution.status not in ("in_progress", "completed"):
+    if execution.status not in ("in_progress", "completed", "suspended"):
         raise HTTPException(status_code=400, detail="当前状态不允许取消")
     execution.status = "cancelled"
     db.commit()

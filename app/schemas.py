@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 
 
@@ -125,6 +125,13 @@ class ExecutionOut(BaseModel):
     arbitration_at: Optional[datetime] = None
     arbitration_comment: str = ""
     force_completed: int = 0
+    suspended_by: str = ""
+    suspended_at: Optional[datetime] = None
+    suspend_reason: str = ""
+    terminated_by: str = ""
+    terminated_at: Optional[datetime] = None
+    terminate_reason: str = ""
+    last_revision_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     execution_items: List[ExecutionItemOut] = []
@@ -163,6 +170,34 @@ class NonConformanceEscalate(BaseModel):
     reason: str = ""
 
 
+class NCEscalationRuleCreate(BaseModel):
+    product_line_id: Optional[int] = None
+    trigger_type: str = "recurring_count"
+    trigger_value: int = 3
+    from_severity: str = "minor"
+    to_severity: str = "major"
+    window_days: int = 30
+    rule_name: str = ""
+    created_by: str = ""
+
+
+class NCEscalationRuleOut(BaseModel):
+    id: int
+    product_line_id: Optional[int] = None
+    trigger_type: str
+    trigger_value: int
+    from_severity: str
+    to_severity: str
+    window_days: int
+    rule_name: str
+    is_active: int
+    created_by: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class RectificationCreate(BaseModel):
     action_plan: str
     responsible_person: str
@@ -189,6 +224,7 @@ class RectificationOut(BaseModel):
     verified_by: str
     verified_at: Optional[datetime] = None
     remark: str
+    pending_transfer_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
@@ -199,6 +235,7 @@ class RectificationOut(BaseModel):
 class RectificationTransferCreate(BaseModel):
     to_person: str
     reason: str = ""
+    requested_by: str = ""
 
 
 class RectificationTransferOut(BaseModel):
@@ -207,7 +244,31 @@ class RectificationTransferOut(BaseModel):
     from_person: str
     to_person: str
     reason: str
-    transferred_at: datetime
+    transferred_at: Optional[datetime] = None
+    status: str
+    approver: str = ""
+    approved_at: Optional[datetime] = None
+    approval_comment: str = ""
+    requested_by: str = ""
+    requested_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TransferApprovalRequest(BaseModel):
+    approver: str
+    decision: str
+    comment: str = ""
+
+
+class TransferApprovalOut(BaseModel):
+    id: int
+    transfer_id: int
+    approver: str
+    decision: str
+    comment: str
+    approved_at: datetime
 
     class Config:
         from_attributes = True
@@ -237,6 +298,30 @@ class ArbitrationRequest(BaseModel):
     comment: str = ""
 
 
+class ConsensusVote(BaseModel):
+    voter: str
+    vote: str
+    comment: str = ""
+
+
+class ConsensusOut(BaseModel):
+    id: int
+    execution_id: int
+    voter: str
+    vote: str
+    comment: str
+    voted_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ConsensusCheckRequest(BaseModel):
+    threshold_ratio: Optional[float] = None
+    min_voters: Optional[int] = None
+    final_decision_maker: Optional[str] = None
+
+
 class BatchScoreRequest(BaseModel):
     items: List[ExecutionItemScore]
 
@@ -244,6 +329,7 @@ class BatchScoreRequest(BaseModel):
 class ScoreRevisionOut(BaseModel):
     id: int
     execution_item_id: int
+    execution_id: Optional[int] = None
     old_score: float
     new_score: float
     old_result: str
@@ -255,9 +341,18 @@ class ScoreRevisionOut(BaseModel):
     changed_by: str
     changed_at: datetime
     reason: str
+    revision_group: str = ""
+    snapshot: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
+
+
+class ScoreReplayRequest(BaseModel):
+    revision_ids: List[int] = []
+    revision_group: str = ""
+    operated_by: str
+    reason: str = ""
 
 
 class ScoreModifyRequest(BaseModel):
@@ -276,6 +371,16 @@ class ReopenRequest(BaseModel):
     reason: str = ""
 
 
+class SuspendRequest(BaseModel):
+    operated_by: str
+    reason: str = ""
+
+
+class TerminateRequest(BaseModel):
+    operated_by: str
+    reason: str = ""
+
+
 class TemplateMigrateRequest(BaseModel):
     operated_by: str
 
@@ -283,6 +388,22 @@ class TemplateMigrateRequest(BaseModel):
 class TemplateRollbackRequest(BaseModel):
     target_version: int
     operated_by: str
+
+
+class TemplateCostEstimateOut(BaseModel):
+    template_id: int
+    template_name: str
+    from_version: int
+    to_version: int
+    affected_in_progress: int
+    affected_completed: int
+    affected_total: int
+    item_diff_added: int
+    item_diff_removed: int
+    item_diff_modified: int
+    complexity_score: int
+    risk_level: str
+    recommendation: str
 
 
 class UserCreate(BaseModel):
@@ -313,6 +434,30 @@ class UserOut(BaseModel):
         from_attributes = True
 
 
+class RBACEntryCreate(BaseModel):
+    role: str
+    resource: str
+    action: str
+    description: str = ""
+
+
+class RBACEntryOut(BaseModel):
+    id: int
+    role: str
+    resource: str
+    action: str
+    description: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RBACMatrixOut(BaseModel):
+    role: str
+    permissions: List[Dict[str, str]] = []
+
+
 class AuditLogOut(BaseModel):
     id: int
     username: str
@@ -324,6 +469,13 @@ class AuditLogOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AuditLogAggOut(BaseModel):
+    date: str
+    username: str
+    action: str
+    count: int
 
 
 ExecutionOut.model_rebuild()

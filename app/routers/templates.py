@@ -5,6 +5,7 @@ from app.models import ChecklistTemplate, TemplateItem, Execution, ExecutionItem
 from app.schemas import (
     TemplateCreate, TemplateOut, TemplateItemCreate, TemplateItemOut,
     TemplateVersionOut, TemplateMigrateRequest, TemplateRollbackRequest,
+    TemplateCostEstimateOut,
 )
 
 router = APIRouter(prefix="/api/templates", tags=["清单模板管理"])
@@ -121,6 +122,126 @@ def list_template_versions(template_id: int, db: Session = Depends(get_db)):
         .order_by(ChecklistTemplate.version.asc())
         .all()
     )
+
+
+def _compute_item_diff(old_tpl: ChecklistTemplate, new_tpl: ChecklistTemplate):
+    old_map = {(it.category, it.name): it for it in old_tpl.items}
+    new_map = {(it.category, it.name): it for it in new_tpl.items}
+    added, removed, modified = 0, 0, 0
+    for key, new_item in new_map.items():
+        if key not in old_map:
+            added += 1
+            continue
+        old_item = old_map[key]
+        if (old_item.description != new_item.description
+                or old_item.standard != new_item.standard
+                or old_item.score_weight != new_item.score_weight
+                or old_item.is_required != new_item.is_required):
+            modified += 1
+    for key in old_map:
+        if key not in new_map:
+            removed += 1
+    return added, removed, modified
+
+
+def _estimate_cost(
+    db: Session, tpl: ChecklistTemplate, from_tpl: ChecklistTemplate, to_tpl: ChecklistTemplate,
+) -> TemplateCostEstimateOut:
+    in_progress_count = (
+        db.query(Execution).filter(
+            Execution.template_id == from_tpl.id, Execution.status == "in_progress",
+        ).count()
+    )
+    completed_count = (
+        db.query(Execution).filter(
+            Execution.template_id == from_tpl.id,
+            Execution.status.in_(["completed", "arbitrated"]),
+        ).count()
+    )
+    added, removed, modified = _compute_item_diff(from_tpl, to_tpl)
+    total_items = max(len(from_tpl.items), 1)
+    change_ratio = (added + removed + modified) / total_items
+    complexity = int(
+        in_progress_count * 5
+        + completed_count * 2
+        + added * 3
+        + removed * 4
+        + modified * 2
+        + change_ratio * 10
+    )
+    if complexity >= 40 or (in_progress_count >= 5 and change_ratio >= 0.5):
+        risk = "high"
+        recommendation = "建议先评估执行记录影响，考虑分批迁移或强制在空闲时段迁移"
+    elif complexity >= 15 or (in_progress_count >= 2 and change_ratio >= 0.3):
+        risk = "medium"
+        recommendation = "建议确认检查项差异和进行中执行数量后再迁移"
+    else:
+        risk = "low"
+        recommendation = "可以安全迁移"
+    return TemplateCostEstimateOut(
+        template_id=tpl.id,
+        template_name=tpl.name,
+        from_version=from_tpl.version,
+        to_version=to_tpl.version,
+        affected_in_progress=in_progress_count,
+        affected_completed=completed_count,
+        affected_total=in_progress_count + completed_count,
+        item_diff_added=added,
+        item_diff_removed=removed,
+        item_diff_modified=modified,
+        complexity_score=complexity,
+        risk_level=risk,
+        recommendation=recommendation,
+    )
+
+
+@router.get("/{template_id}/estimate-migrate", response_model=TemplateCostEstimateOut)
+def estimate_migrate(template_id: int, db: Session = Depends(get_db)):
+    new_tpl = db.query(ChecklistTemplate).filter(ChecklistTemplate.id == template_id).first()
+    if not new_tpl:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    old_tpl = (
+        db.query(ChecklistTemplate)
+        .filter(
+            ChecklistTemplate.product_line_id == new_tpl.product_line_id,
+            ChecklistTemplate.name == new_tpl.name,
+            ChecklistTemplate.status == "active",
+            ChecklistTemplate.id != new_tpl.id,
+        )
+        .first()
+    )
+    if not old_tpl:
+        raise HTTPException(status_code=400, detail="没有找到当前激活的旧版本模板，无法评估迁移成本")
+    return _estimate_cost(db, new_tpl, old_tpl, new_tpl)
+
+
+@router.get("/{template_id}/estimate-rollback", response_model=TemplateCostEstimateOut)
+def estimate_rollback(template_id: int, target_version: int, db: Session = Depends(get_db)):
+    current_tpl = db.query(ChecklistTemplate).filter(ChecklistTemplate.id == template_id).first()
+    if not current_tpl:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    target_tpl = (
+        db.query(ChecklistTemplate)
+        .filter(
+            ChecklistTemplate.product_line_id == current_tpl.product_line_id,
+            ChecklistTemplate.name == current_tpl.name,
+            ChecklistTemplate.version == target_version,
+        )
+        .first()
+    )
+    if not target_tpl:
+        raise HTTPException(status_code=400, detail=f"目标版本 v{target_version} 不存在")
+    active_tpl = (
+        db.query(ChecklistTemplate)
+        .filter(
+            ChecklistTemplate.product_line_id == current_tpl.product_line_id,
+            ChecklistTemplate.name == current_tpl.name,
+            ChecklistTemplate.status == "active",
+        )
+        .first()
+    )
+    from_tpl = active_tpl or current_tpl
+    return _estimate_cost(db, current_tpl, from_tpl, target_tpl)
 
 
 @router.post("/{template_id}/migrate", response_model=dict)

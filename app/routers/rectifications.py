@@ -2,10 +2,11 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import Rectification, NonConformance, RectificationTransfer, AuditLog
+from app.models import Rectification, NonConformance, RectificationTransfer, TransferApproval, AuditLog
 from app.schemas import (
     RectificationCreate, RectificationUpdate, RectificationOut,
     RectificationTransferCreate, RectificationTransferOut,
+    TransferApprovalRequest, TransferApprovalOut,
 )
 
 router = APIRouter(prefix="/api/rectifications", tags=["整改追踪"])
@@ -89,6 +90,79 @@ def update_rectification(rectification_id: int, data: RectificationUpdate, db: S
     return rect
 
 
+@router.post("/{rectification_id}/transfer-request", response_model=RectificationTransferOut)
+def request_transfer(rectification_id: int, data: RectificationTransferCreate, db: Session = Depends(get_db)):
+    rect = db.query(Rectification).filter(Rectification.id == rectification_id).first()
+    if not rect:
+        raise HTTPException(status_code=404, detail="整改记录不存在")
+    if rect.status in ("completed", "verified"):
+        raise HTTPException(status_code=400, detail="已完成的整改单不能申请转移")
+    if rect.pending_transfer_id is not None:
+        pending = db.query(RectificationTransfer).filter(RectificationTransfer.id == rect.pending_transfer_id).first()
+        if pending and pending.status == "pending":
+            raise HTTPException(status_code=400, detail="已有待审批的转移申请")
+    if data.to_person == rect.responsible_person:
+        raise HTTPException(status_code=400, detail="不能转移给当前负责人")
+    now = datetime.utcnow()
+    transfer = RectificationTransfer(
+        rectification_id=rectification_id,
+        from_person=rect.responsible_person,
+        to_person=data.to_person,
+        reason=data.reason,
+        status="pending",
+        requested_by=data.requested_by or rect.responsible_person,
+        requested_at=now,
+    )
+    db.add(transfer)
+    db.flush()
+    rect.pending_transfer_id = transfer.id
+    _log(db, data.requested_by or rect.responsible_person, "request_transfer", "rectification", rectification_id,
+         f"from={transfer.from_person} to={data.to_person}")
+    db.commit()
+    db.refresh(transfer)
+    return transfer
+
+
+@router.post("/{rectification_id}/transfer-approve", response_model=RectificationOut)
+def approve_transfer(rectification_id: int, data: TransferApprovalRequest, db: Session = Depends(get_db)):
+    rect = db.query(Rectification).filter(Rectification.id == rectification_id).first()
+    if not rect:
+        raise HTTPException(status_code=404, detail="整改记录不存在")
+    if rect.pending_transfer_id is None:
+        raise HTTPException(status_code=400, detail="没有待审批的转移申请")
+    transfer = db.query(RectificationTransfer).filter(RectificationTransfer.id == rect.pending_transfer_id).first()
+    if not transfer or transfer.status != "pending":
+        raise HTTPException(status_code=400, detail="当前没有待审批的转移申请")
+    if data.decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision 只能是 approved 或 rejected")
+    now = datetime.utcnow()
+    approval = TransferApproval(
+        transfer_id=transfer.id,
+        approver=data.approver,
+        decision=data.decision,
+        comment=data.comment,
+        approved_at=now,
+    )
+    db.add(approval)
+    transfer.approver = data.approver
+    transfer.approved_at = now
+    transfer.approval_comment = data.comment
+    if data.decision == "approved":
+        transfer.status = "completed"
+        transfer.transferred_at = now
+        rect.responsible_person = transfer.to_person
+        rect.pending_transfer_id = None
+        _log(db, data.approver, "approve_transfer", "rectification", rectification_id,
+             f"approved: {transfer.from_person}->{transfer.to_person}")
+    else:
+        transfer.status = "rejected"
+        rect.pending_transfer_id = None
+        _log(db, data.approver, "reject_transfer", "rectification", rectification_id, data.comment)
+    db.commit()
+    db.refresh(rect)
+    return rect
+
+
 @router.post("/{rectification_id}/transfer", response_model=RectificationOut)
 def transfer_rectification(rectification_id: int, data: RectificationTransferCreate, db: Session = Depends(get_db)):
     rect = db.query(Rectification).filter(Rectification.id == rectification_id).first()
@@ -98,15 +172,23 @@ def transfer_rectification(rectification_id: int, data: RectificationTransferCre
         raise HTTPException(status_code=400, detail="已完成的整改单不能转移")
     if data.to_person == rect.responsible_person:
         raise HTTPException(status_code=400, detail="不能转移给当前负责人")
+    now = datetime.utcnow()
     transfer = RectificationTransfer(
         rectification_id=rectification_id,
         from_person=rect.responsible_person,
         to_person=data.to_person,
         reason=data.reason,
+        status="completed",
+        approver=data.requested_by,
+        transferred_at=now,
+        approved_at=now,
+        requested_by=data.requested_by or rect.responsible_person,
+        requested_at=now,
     )
     db.add(transfer)
     rect.responsible_person = data.to_person
-    _log(db, data.to_person, "transfer_rectification", "rectification", rectification_id,
+    rect.pending_transfer_id = None
+    _log(db, data.requested_by or rect.responsible_person, "direct_transfer", "rectification", rectification_id,
          f"from={transfer.from_person} to={data.to_person}")
     db.commit()
     db.refresh(rect)
@@ -118,7 +200,18 @@ def list_transfers(rectification_id: int, db: Session = Depends(get_db)):
     rect = db.query(Rectification).filter(Rectification.id == rectification_id).first()
     if not rect:
         raise HTTPException(status_code=404, detail="整改记录不存在")
-    return db.query(RectificationTransfer).filter(RectificationTransfer.rectification_id == rectification_id).order_by(RectificationTransfer.transferred_at.desc()).all()
+    return db.query(RectificationTransfer).filter(RectificationTransfer.rectification_id == rectification_id).order_by(RectificationTransfer.requested_at.desc()).all()
+
+
+@router.get("/{rectification_id}/transfer-approvals", response_model=list[TransferApprovalOut])
+def list_transfer_approvals(rectification_id: int, db: Session = Depends(get_db)):
+    rect = db.query(Rectification).filter(Rectification.id == rectification_id).first()
+    if not rect:
+        raise HTTPException(status_code=404, detail="整改记录不存在")
+    transfer_ids = [t.id for t in rect.transfers]
+    if not transfer_ids:
+        return []
+    return db.query(TransferApproval).filter(TransferApproval.transfer_id.in_(transfer_ids)).order_by(TransferApproval.approved_at.desc()).all()
 
 
 @router.post("/{rectification_id}/reopen", response_model=RectificationOut)
