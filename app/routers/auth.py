@@ -3,10 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy import func, cast, String
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import User, AuditLog, RBACMatrix
+from app.models import User, AuditLog, RBACMatrix, RBACProfile, IndexStats
 from app.schemas import (
     UserCreate, UserUpdate, UserOut, AuditLogOut, AuditLogAggOut,
     RBACEntryCreate, RBACEntryOut, RBACMatrixOut,
+    RBACProfileCreate, RBACProfileOut,
+    IndexStatsCaptureRequest, IndexStatsOut,
 )
 
 router = APIRouter(prefix="/api/users", tags=["用户与权限"])
@@ -361,6 +363,149 @@ def aggregate_audit_logs(
 @router.get("/scope/product-lines", response_model=list[int])
 def get_my_product_lines(current_user: User = Depends(get_current_user)):
     return get_user_product_line_ids(current_user)
+
+
+# ============ RBAC 矩阵运行时切换（Profile）（放 /{user_id} 之前避免路由冲突）============
+
+@router.post("/rbac/profiles", response_model=RBACProfileOut)
+def create_rbac_profile(data: RBACProfileCreate, current_user: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    profile = RBACProfile(
+        name=data.name,
+        description=data.description,
+        is_active=0,
+        entries=[{"role": e.get("role"), "resource": e.get("resource"),
+                  "action": e.get("action"), "description": e.get("description", "")}
+                 for e in data.entries],
+        created_by=current_user.username,
+        created_at=now,
+    )
+    db.add(profile)
+    _log(db, current_user.username, "create_rbac_profile", "rbac_profile", 0, data.name)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.get("/rbac/profiles", response_model=list[RBACProfileOut])
+def list_rbac_profiles(current_user: User = Depends(require_role("admin", "qa_manager")), db: Session = Depends(get_db)):
+    return db.query(RBACProfile).order_by(RBACProfile.created_at.desc()).all()
+
+
+@router.post("/rbac/profiles/{profile_id}/activate", response_model=RBACProfileOut)
+def activate_rbac_profile(profile_id: int, current_user: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    profile = db.query(RBACProfile).filter(RBACProfile.id == profile_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="RBAC Profile 不存在")
+    now = datetime.utcnow()
+    db.query(RBACProfile).update({RBACProfile.is_active: 0})
+    db.query(RBACMatrix).delete()
+    entries = profile.entries or []
+    for e in entries:
+        db.add(RBACMatrix(
+            role=e.get("role"), resource=e.get("resource"),
+            action=e.get("action"), description=e.get("description", ""),
+        ))
+    profile.is_active = 1
+    profile.activated_by = current_user.username
+    profile.activated_at = now
+    _log(db, current_user.username, "activate_rbac_profile", "rbac_profile", profile_id, profile.name)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.delete("/rbac/profiles/{profile_id}")
+def delete_rbac_profile(profile_id: int, current_user: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    profile = db.query(RBACProfile).filter(RBACProfile.id == profile_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="RBAC Profile 不存在")
+    if profile.is_active:
+        raise HTTPException(status_code=400, detail="不能删除激活中的 Profile")
+    db.delete(profile)
+    db.commit()
+    return {"detail": "删除成功"}
+
+
+# ============ log 记录查询索引优化（EXPLAIN + 统计）（放 /{user_id} 之前避免路由冲突）============
+
+@router.post("/index-stats/capture", response_model=list[IndexStatsOut])
+def capture_index_stats(data: IndexStatsCaptureRequest, current_user: User = Depends(require_role("admin")),
+                        db: Session = Depends(get_db)):
+    default_queries = {
+        "audit_logs_user_action": "SELECT * FROM audit_logs WHERE username='admin01' AND action='create_execution' ORDER BY created_at DESC LIMIT 100",
+        "audit_logs_date_agg": "SELECT strftime('%Y-%m-%d', created_at) d, action, COUNT(*) FROM audit_logs GROUP BY d, action",
+        "score_revisions_item": "SELECT * FROM score_revisions WHERE execution_item_id=1 ORDER BY changed_at DESC",
+        "executions_pl_status": "SELECT * FROM executions WHERE product_line_id=1 AND status='in_progress'",
+        "nonconformances_severity": "SELECT * FROM nonconformances WHERE severity='minor' ORDER BY created_at DESC",
+        "rectifications_overdue": "SELECT * FROM rectifications WHERE status='pending' AND due_date < date('now')",
+    }
+    sample_queries = data.sample_queries or default_queries
+    now = datetime.utcnow()
+    results = []
+    for idx_name, sql in sample_queries.items():
+        try:
+            explain_sql = f"EXPLAIN QUERY PLAN {sql}"
+            rs = db.execute(explain_sql)
+            rows = rs.fetchall()
+            plan_lines = []
+            for r in rows:
+                cols = list(r) if not isinstance(r, dict) else list(r.values())
+                plan_lines.append(" | ".join(str(c) for c in cols))
+            plan_str = "\n".join(plan_lines)
+            uses_index = any("USING INDEX" in pl.upper() or "SEARCH" in pl.upper() for pl in plan_lines)
+            stat = IndexStats(
+                table_name=idx_name.split("_")[0],
+                index_name=idx_name,
+                seq_scan=0 if uses_index else 1,
+                seq_scan_rows=0,
+                idx_scan=1 if uses_index else 0,
+                idx_scan_rows=0,
+                idx_size_bytes=0,
+                sample_query=sql,
+                explain_plan=plan_str,
+                captured_at=now,
+            )
+            db.add(stat)
+            results.append(stat)
+        except Exception as e:
+            stat = IndexStats(
+                table_name=idx_name,
+                index_name=idx_name,
+                seq_scan=1,
+                seq_scan_rows=0,
+                idx_scan=0,
+                idx_scan_rows=0,
+                idx_size_bytes=0,
+                sample_query=sql,
+                explain_plan=f"ERROR: {str(e)}",
+                captured_at=now,
+            )
+            db.add(stat)
+            results.append(stat)
+    db.commit()
+    for s in results:
+        db.refresh(s)
+    return results
+
+
+@router.get("/index-stats", response_model=list[IndexStatsOut])
+def list_index_stats(limit: int = 100, current_user: User = Depends(require_role("admin", "qa_manager")),
+                     db: Session = Depends(get_db)):
+    return db.query(IndexStats).order_by(IndexStats.captured_at.desc()).limit(limit).all()
+
+
+@router.get("/index-stats/summary")
+def index_stats_summary(current_user: User = Depends(require_role("admin", "qa_manager")), db: Session = Depends(get_db)):
+    total = db.query(IndexStats).count()
+    idx_ok = db.query(IndexStats).filter(IndexStats.idx_scan > 0).count()
+    idx_miss = db.query(IndexStats).filter(IndexStats.seq_scan > 0).count()
+    return {
+        "total_samples": total,
+        "index_hit_samples": idx_ok,
+        "index_miss_samples": idx_miss,
+        "hit_ratio": round(idx_ok / total, 4) if total > 0 else 0.0,
+    }
 
 
 # --- /{user_id} 相关路由放最后，避免吞掉具体路径 ---

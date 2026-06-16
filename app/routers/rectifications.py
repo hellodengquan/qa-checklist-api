@@ -2,11 +2,12 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import Rectification, NonConformance, RectificationTransfer, TransferApproval, AuditLog
+from app.models import Rectification, NonConformance, RectificationTransfer, TransferApproval, AuditLog, TransferApprovalChain
 from app.schemas import (
     RectificationCreate, RectificationUpdate, RectificationOut,
     RectificationTransferCreate, RectificationTransferOut,
     TransferApprovalRequest, TransferApprovalOut,
+    TransferChainCreate, TransferChainStepOut, TransferChainApproveRequest,
 )
 
 router = APIRouter(prefix="/api/rectifications", tags=["整改追踪"])
@@ -229,3 +230,129 @@ def reopen_rectification(rectification_id: int, operated_by: str = "", reason: s
     db.commit()
     db.refresh(rect)
     return rect
+
+
+# ============ RectificationTransfer 多级签字审批链 ============
+
+@router.post("/{rectification_id}/transfer-chain", response_model=list[TransferChainStepOut])
+def create_transfer_approval_chain(rectification_id: int, data: TransferChainCreate, db: Session = Depends(get_db)):
+    transfer = db.query(RectificationTransfer).filter(RectificationTransfer.id == data.transfer_id).first()
+    if not transfer:
+        raise HTTPException(status_code=404, detail="整改委托单不存在")
+    if transfer.rectification_id != rectification_id:
+        raise HTTPException(status_code=400, detail="委托单不属于该整改记录")
+    if not data.approvers:
+        raise HTTPException(status_code=400, detail="至少需要一个审批人")
+    transfer.approval_mode = data.mode
+    transfer.required_approvers = ",".join(data.approvers)
+    transfer.current_approver_index = 0 if data.mode == "serial" else 0
+    transfer.approval_chain_status = "pending"
+    steps = []
+    for idx, approver in enumerate(data.approvers):
+        step = TransferApprovalChain(
+            transfer_id=transfer.id,
+            approver=approver,
+            step_index=idx,
+            decision="pending",
+        )
+        db.add(step)
+        steps.append(step)
+    _log(db, transfer.requested_by or "system", "create_transfer_chain",
+         "transfer", transfer.id, f"mode={data.mode}, approvers={len(data.approvers)}")
+    db.commit()
+    for s in steps:
+        db.refresh(s)
+    return steps
+
+
+@router.post("/{rectification_id}/transfer-chain/{transfer_id}/approve", response_model=TransferChainStepOut)
+def approve_transfer_chain_step(rectification_id: int, transfer_id: int, data: TransferChainApproveRequest, db: Session = Depends(get_db)):
+    transfer = db.query(RectificationTransfer).filter(RectificationTransfer.id == transfer_id).first()
+    if not transfer:
+        raise HTTPException(status_code=404, detail="整改委托单不存在")
+    if transfer.rectification_id != rectification_id:
+        raise HTTPException(status_code=400, detail="委托单不属于该整改记录")
+    steps = db.query(TransferApprovalChain).filter(
+        TransferApprovalChain.transfer_id == transfer_id
+    ).order_by(TransferApprovalChain.step_index).all()
+    if not steps:
+        raise HTTPException(status_code=400, detail="该委托单还未创建多级审批链")
+    now = datetime.utcnow()
+    if transfer.approval_mode == "serial":
+        current_idx = transfer.current_approver_index or 0
+        if current_idx >= len(steps):
+            raise HTTPException(status_code=400, detail="该审批链已完成")
+        current_step = steps[current_idx]
+        if current_step.approver != data.approver:
+            raise HTTPException(status_code=403, detail=f"当前审批人应为 {current_step.approver}，不是 {data.approver}")
+        current_step.decision = data.decision
+        current_step.comment = data.comment
+        current_step.decided_at = now
+        if data.decision == "rejected":
+            transfer.approval_chain_status = "rejected"
+            transfer.status = "rejected"
+            db.add(TransferApproval(transfer_id=transfer.id, approver=data.approver,
+                                    decision="rejected", comment=data.comment, approved_at=now))
+        elif data.decision == "approved":
+            next_idx = current_idx + 1
+            if next_idx >= len(steps):
+                transfer.approval_chain_status = "completed"
+                transfer.current_approver_index = next_idx
+                rect = db.query(Rectification).filter(Rectification.id == transfer.rectification_id).first()
+                if rect:
+                    rect.responsible_person = transfer.to_person
+                    rect.pending_transfer_id = None
+                transfer.status = "completed"
+                db.add(TransferApproval(transfer_id=transfer.id, approver=data.approver,
+                                        decision="approved", comment=data.comment, approved_at=now))
+            else:
+                transfer.current_approver_index = next_idx
+        db.commit()
+        db.refresh(current_step)
+        return current_step
+    else:
+        my_step = None
+        for s in steps:
+            if s.approver == data.approver:
+                my_step = s
+                break
+        if not my_step:
+            raise HTTPException(status_code=403, detail=f"审批人 {data.approver} 不在审批链中")
+        if my_step.decision != "pending":
+            raise HTTPException(status_code=400, detail="该审批人已完成审批")
+        my_step.decision = data.decision
+        my_step.comment = data.comment
+        my_step.decided_at = now
+        approved_count = sum(1 for s in steps if s.decision == "approved")
+        rejected_count = sum(1 for s in steps if s.decision == "rejected")
+        if rejected_count > 0:
+            transfer.approval_chain_status = "rejected"
+            transfer.status = "rejected"
+            db.add(TransferApproval(transfer_id=transfer.id, approver=data.approver,
+                                    decision="rejected", comment=data.comment, approved_at=now))
+        elif approved_count == len(steps):
+            transfer.approval_chain_status = "completed"
+            rect = db.query(Rectification).filter(Rectification.id == transfer.rectification_id).first()
+            if rect:
+                rect.responsible_person = transfer.to_person
+                rect.pending_transfer_id = None
+            transfer.status = "completed"
+            db.add(TransferApproval(transfer_id=transfer.id, approver=data.approver,
+                                    decision="approved", comment=data.comment, approved_at=now))
+        else:
+            transfer.approval_chain_status = "in_progress"
+        db.commit()
+        db.refresh(my_step)
+        return my_step
+
+
+@router.get("/{rectification_id}/transfer-chain/{transfer_id}", response_model=list[TransferChainStepOut])
+def list_transfer_chain_steps(rectification_id: int, transfer_id: int, db: Session = Depends(get_db)):
+    transfer = db.query(RectificationTransfer).filter(RectificationTransfer.id == transfer_id).first()
+    if not transfer:
+        raise HTTPException(status_code=404, detail="整改委托单不存在")
+    if transfer.rectification_id != rectification_id:
+        raise HTTPException(status_code=400, detail="委托单不属于该整改记录")
+    return db.query(TransferApprovalChain).filter(
+        TransferApprovalChain.transfer_id == transfer_id
+    ).order_by(TransferApprovalChain.step_index).all()

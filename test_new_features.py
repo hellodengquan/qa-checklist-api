@@ -266,6 +266,172 @@ agg = ok("aggregate audit logs", client.get(
 assert isinstance(agg, list)
 print(f"审计日志: list={len(logs)} 条, agg={len(agg)} 组")
 
+# ============================================================
+# 第二轮 8 个 Feature
+# ============================================================
+print("\n\n" + ">" * 60)
+print(">>>>>>>> 第二轮 8 Feature 测试 <<<<<<<<")
+print(">" * 60)
+
+# ---------- [Feature 1] ScoreRevision 回放并发隔离 ----------
+print("\n[第二轮 Feature 1] ScoreRevision 回放并发隔离")
+revs2 = ok("list revisions", client.get(
+    f"/api/executions/{exec1['id']}/score-revisions", headers=H))
+rev_ids = [r["id"] for r in revs2[:2]]
+lock = ok("acquire replay lock", client.post(
+    f"/api/executions/{exec1['id']}/replay-lock",
+    json={"revision_ids": rev_ids, "held_by": "admin01", "ttl_seconds": 300},
+    headers=H))
+print(f"回放锁 token={lock['replay_token']}, status={lock['status']}")
+r_conflict = client.post(
+    f"/api/executions/{exec1['id']}/replay-lock",
+    json={"revision_ids": rev_ids, "held_by": "inspector01", "ttl_seconds": 300},
+    headers=H)
+print(f"并发抢占 status={r_conflict.status_code} (expected 409)")
+assert r_conflict.status_code == 409
+release = ok("release replay lock", client.post(
+    f"/api/executions/{exec1['id']}/replay-lock/{lock['replay_token']}/release",
+    headers=H))
+print(f"释放锁 ok, status={release['status']}")
+
+# ---------- [Feature 2] RectificationTransfer 多级签字审批链 ----------
+print("\n[第二轮 Feature 2] RectificationTransfer 多级签字")
+t_req = ok("request transfer v2", client.post(
+    f"/api/rectifications/{rct_id}/transfer-request",
+    json={"to_person": "inspector02", "reason": "出差委托", "requested_by": "inspector01"},
+    headers=H))
+print(f"转移申请 id={t_req['id']}")
+chain = ok("create serial approval chain", client.post(
+    f"/api/rectifications/{rct_id}/transfer-chain",
+    json={"transfer_id": t_req["id"], "approvers": ["qa_manager01", "qa_manager02"], "mode": "serial"},
+    headers=H))
+print(f"审批链: {len(chain)} 步, approvers={[s['approver'] for s in chain]}")
+# 第一步审批
+step1 = ok("approve step 1", client.post(
+    f"/api/rectifications/{rct_id}/transfer-chain/{t_req['id']}/approve",
+    json={"approver": "qa_manager01", "decision": "approved", "comment": "同意第一步"},
+    headers=H))
+print(f"step1 ok: decision={step1['decision']}")
+# 非当前审批人不能批
+r_wrong = client.post(
+    f"/api/rectifications/{rct_id}/transfer-chain/{t_req['id']}/approve",
+    json={"approver": "qa_manager01", "decision": "approved"},
+    headers=H)
+print(f"非当前审批人 status={r_wrong.status_code} (expected 403)")
+# 第二步审批
+step2 = ok("approve step 2 (serial final)", client.post(
+    f"/api/rectifications/{rct_id}/transfer-chain/{t_req['id']}/approve",
+    json={"approver": "qa_manager02", "decision": "approved", "comment": "同意第二步"},
+    headers=H))
+print(f"多级串行审批 ok, 最终 decision={step2['decision']}")
+steps_final = ok("list chain steps", client.get(
+    f"/api/rectifications/{rct_id}/transfer-chain/{t_req['id']}",
+    headers=H))
+assert all(s["decision"] == "approved" for s in steps_final)
+
+# ---------- [第二轮 Feature 3] executions 异常流转死信清理 ----------
+print("\n[第二轮 Feature 3] executions 异常流转死信清理")
+# 新建一个执行记录，然后取消
+exec_dl = ok("create execution for dead letter", client.post(
+    "/api/executions", headers=H, json={
+        "template_id": tpl2["id"], "executor": "admin01", "batch_prefix": "DL-TEST",
+    }))
+r_cancel = ok("cancel execution for DL", client.post(
+    f"/api/executions/{exec_dl['id']}/cancel", headers=H))
+print(f"取消 status={r_cancel['status']}")
+dl = ok("archive dead letter", client.post(
+    "/api/executions/dead-letter/archive",
+    json={"reason": "长期挂起清理", "execution_ids": [r_cancel["id"]]},
+    headers=H))
+print(f"死信归档 ok: {len(dl)} 条, batch_no={dl[0]['batch_no']}")
+dl_list = ok("list dead letter archives", client.get(
+    "/api/executions/dead-letter/list?limit=10", headers=H))
+print(f"死信列表: {len(dl_list)} 条")
+
+# ---------- [第二轮 Feature 4] NC 升级阈值动态调优 ----------
+print("\n[第二轮 Feature 4] NC 升级阈值动态调优")
+tuning = ok("analyze nc threshold", client.post(
+    "/api/executions/nc-threshold/analyze",
+    json={"severity": "minor", "trigger_type": "recurring_count", "window_days": 30, "apply_recommendation": False},
+    headers=H))
+print(f"阈值调优 ok: current={tuning['current_value']}, "
+      f"recommended={tuning['recommended_value']}, "
+      f"confidence={tuning['confidence']}, sample={tuning['sample_size']}")
+tuning_hist = ok("list tuning history", client.get(
+    "/api/executions/nc-threshold/history?limit=10", headers=H))
+print(f"阈值调优历史: {len(tuning_hist)} 条")
+
+# ---------- [第二轮 Feature 5] 版本回滚迁移成本分批策略 ----------
+print("\n[第二轮 Feature 5] 版本迁移分批策略")
+# 创建第二条执行记录（用模板 v2）
+pl_id = pl["id"]
+tpl1_id = tpl["id"]   # v1
+tpl2_id = tpl2["id"]  # v2
+exec2 = ok("create second execution for batch migration", client.post(
+    "/api/executions",
+    json={"template_id": tpl2_id, "product_line_id": pl_id, "executor": "inspector01", "batch_prefix": "QA"},
+    headers=H2))
+# 建一个反向迁移任务 (v2 -> v1)
+mb = ok("create migration batch", client.post(
+    "/api/templates/migration-batches",
+    params={"created_by": "admin01"},
+    json={"from_template_id": tpl2_id, "to_template_id": tpl1_id,
+          "strategy": "time_window", "batch_size": 10},
+    headers=H))
+print(f"分批任务 id={mb['id']}, total_target={mb['total_target']}, status={mb['status']}")
+mb_run = ok("run migration batch next", client.post(
+    f"/api/templates/migration-batches/{mb['id']}/run-next",
+    headers=H))
+print(f"执行分批 ok: processed={mb_run['total_processed']}, failed={mb_run['total_failed']}, status={mb_run['status']}")
+mb_list = ok("list migration batches", client.get(
+    "/api/templates/migration-batches?limit=10", headers=H))
+print(f"分批任务列表: {len(mb_list)} 条")
+
+# ---------- [第二轮 Feature 6] RBAC 矩阵运行时切换（Profile） ----------
+print("\n[第二轮 Feature 6] RBAC 矩阵运行时切换")
+profile = ok("create rbac profile", client.post(
+    "/api/users/rbac/profiles",
+    json={
+        "name": "strict-security",
+        "description": "严格安全模式",
+        "entries": [
+            {"role": "admin", "resource": "*", "action": "*", "description": "admin 全部权限"},
+            {"role": "inspector", "resource": "execution", "action": "read", "description": "只读"},
+        ],
+    },
+    headers=H))
+print(f"Profile id={profile['id']}, name={profile['name']}")
+profiles = ok("list rbac profiles", client.get(
+    "/api/users/rbac/profiles", headers=H))
+print(f"Profile 列表: {len(profiles)} 个")
+activated = ok("activate rbac profile", client.post(
+    f"/api/users/rbac/profiles/{profile['id']}/activate",
+    headers=H))
+print(f"激活 Profile ok: is_active={activated['is_active']}")
+matrix_after = ok("check matrix after activate", client.get(
+    "/api/users/rbac/matrix", headers=H))
+print(f"激活后角色数: {len(matrix_after)}")
+
+# ---------- [第二轮 Feature 7] log 记录查询索引优化 ----------
+print("\n[第二轮 Feature 7] log 记录查询索引优化")
+stats = ok("capture index stats", client.post(
+    "/api/users/index-stats/capture",
+    json={"sample_queries": None},
+    headers=H))
+print(f"索引统计样本: {len(stats)} 个")
+for s in stats:
+    marker = "✓" if s["idx_scan"] > 0 else "✗"
+    print(f"  {marker} {s['index_name']}: idx_scan={s['idx_scan']}, seq={s['seq_scan']}")
+summary = ok("index summary", client.get(
+    "/api/users/index-stats/summary", headers=H))
+print(f"索引命中率: {summary['hit_ratio']*100:.1f}% "
+      f"(hit={summary['index_hit_samples']}, miss={summary['index_miss_samples']})")
+
+# ---------- all done round 2 ----------
+print("\n" + "=" * 60)
+print("ALL ROUND-2 FEATURES TEST PASSED")
+print("=" * 60)
+
 # ---------- all done ----------
 print("\n" + "=" * 60)
 print("ALL 8 NEW FEATURES TEST PASSED")

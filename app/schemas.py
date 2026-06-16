@@ -478,4 +478,168 @@ class AuditLogAggOut(BaseModel):
     count: int
 
 
+# ============ 第二轮 8 个 Feature ============
+
+class ScoreReplayConcurrencyRequest(BaseModel):
+    revision_ids: List[int] = []
+    revision_group: str = ""
+    held_by: str
+    ttl_seconds: int = 300
+
+
+class ScoreReplayConcurrencyOut(BaseModel):
+    id: int
+    execution_id: int
+    replay_token: str
+    revision_ids: str
+    revision_group: str
+    held_by: str
+    held_at: datetime
+    expires_at: Optional[datetime] = None
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
+class TransferChainCreate(BaseModel):
+    transfer_id: int
+    approvers: List[str]
+    mode: str = "serial"
+
+
+class TransferChainStepOut(BaseModel):
+    id: int
+    transfer_id: int
+    approver: str
+    step_index: int
+    decision: str
+    comment: str
+    decided_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TransferChainApproveRequest(BaseModel):
+    approver: str
+    decision: str
+    comment: str = ""
+
+
+class DeadLetterArchiveRequest(BaseModel):
+    reason: str = ""
+    execution_ids: List[int] = []
+
+
+class DeadLetterArchiveOut(BaseModel):
+    id: int
+    execution_id: int
+    batch_no: str
+    original_status: str
+    dead_letter_reason: str
+    archived_by: str
+    archived_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class NCThresholdTuningRequest(BaseModel):
+    product_line_id: Optional[int] = None
+    severity: str = "minor"
+    trigger_type: str = "overdue_days"
+    window_days: int = 30
+    apply_recommendation: bool = False
+
+
+class NCThresholdTuningOut(BaseModel):
+    id: int
+    product_line_id: Optional[int] = None
+    severity: str
+    trigger_type: str
+    current_value: float
+    recommended_value: float
+    confidence: float
+    sample_size: int
+    analysis_window_days: int
+    analyzed_by: str
+    analyzed_at: datetime
+    detail: Optional[Dict[str, Any]] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MigrationBatchCreate(BaseModel):
+    from_template_id: int
+    to_template_id: int
+    strategy: str = "time_window"
+    batch_size: int = 100
+    time_window_start: Optional[str] = None
+    time_window_end: Optional[str] = None
+
+
+class MigrationBatchOut(BaseModel):
+    id: int
+    from_template_id: int
+    to_template_id: int
+    strategy: str
+    batch_size: int
+    time_window_start: Optional[datetime] = None
+    time_window_end: Optional[datetime] = None
+    total_target: int
+    total_processed: int
+    total_failed: int
+    status: str
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RBACProfileCreate(BaseModel):
+    name: str
+    description: str = ""
+    entries: List[Dict[str, Any]] = []
+
+
+class RBACProfileOut(BaseModel):
+    id: int
+    name: str
+    description: str
+    is_active: int
+    activated_by: str
+    activated_at: Optional[datetime] = None
+    entries: Optional[List[Dict[str, Any]]] = None
+    created_by: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class IndexStatsCaptureRequest(BaseModel):
+    sample_queries: Optional[Dict[str, str]] = None
+
+
+class IndexStatsOut(BaseModel):
+    id: int
+    table_name: str
+    index_name: str
+    seq_scan: int
+    seq_scan_rows: int
+    idx_scan: int
+    idx_scan_rows: int
+    idx_size_bytes: int
+    sample_query: str
+    explain_plan: str
+    captured_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 ExecutionOut.model_rebuild()

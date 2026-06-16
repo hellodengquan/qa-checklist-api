@@ -1,11 +1,13 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import ChecklistTemplate, TemplateItem, Execution, ExecutionItem, AuditLog
+from app.models import ChecklistTemplate, TemplateItem, Execution, ExecutionItem, AuditLog, MigrationBatch
 from app.schemas import (
     TemplateCreate, TemplateOut, TemplateItemCreate, TemplateItemOut,
     TemplateVersionOut, TemplateMigrateRequest, TemplateRollbackRequest,
     TemplateCostEstimateOut,
+    MigrationBatchCreate, MigrationBatchOut,
 )
 
 router = APIRouter(prefix="/api/templates", tags=["清单模板管理"])
@@ -72,6 +74,111 @@ def list_templates(
     if status:
         q = q.filter(ChecklistTemplate.status == status)
     return q.order_by(ChecklistTemplate.created_at.desc()).offset(skip).limit(limit).all()
+
+
+# ============ 版本迁移/回滚分批策略（放 /{template_id} 之前避免路由冲突）============
+
+@router.post("/migration-batches", response_model=MigrationBatchOut)
+def create_migration_batch(data: MigrationBatchCreate, created_by: str = "system", db: Session = Depends(get_db)):
+    from_tpl = db.query(ChecklistTemplate).filter(ChecklistTemplate.id == data.from_template_id).first()
+    to_tpl = db.query(ChecklistTemplate).filter(ChecklistTemplate.id == data.to_template_id).first()
+    if not from_tpl or not to_tpl:
+        raise HTTPException(status_code=404, detail="源模板或目标模板不存在")
+    q = db.query(Execution).filter(Execution.template_id == data.from_template_id)
+    if data.strategy == "time_window":
+        if data.time_window_start:
+            try:
+                t_start = datetime.strptime(data.time_window_start, "%Y-%m-%d")
+                q = q.filter(Execution.created_at >= t_start)
+            except ValueError:
+                pass
+        if data.time_window_end:
+            try:
+                t_end = datetime.strptime(data.time_window_end, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                q = q.filter(Execution.created_at <= t_end)
+            except ValueError:
+                pass
+    total = q.count()
+    tw_start = None
+    tw_end = None
+    if data.time_window_start:
+        try:
+            tw_start = datetime.strptime(data.time_window_start, "%Y-%m-%d")
+        except ValueError:
+            pass
+    if data.time_window_end:
+        try:
+            tw_end = datetime.strptime(data.time_window_end, "%Y-%m-%d")
+        except ValueError:
+            pass
+    batch = MigrationBatch(
+        from_template_id=data.from_template_id,
+        to_template_id=data.to_template_id,
+        strategy=data.strategy,
+        batch_size=data.batch_size,
+        time_window_start=tw_start,
+        time_window_end=tw_end,
+        total_target=total,
+        total_processed=0,
+        total_failed=0,
+        status="pending",
+        created_by=created_by,
+    )
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+@router.post("/migration-batches/{batch_id}/run-next", response_model=MigrationBatchOut)
+def run_migration_batch_next(batch_id: int, db: Session = Depends(get_db)):
+    batch = db.query(MigrationBatch).filter(MigrationBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="分批任务不存在")
+    if batch.status == "completed":
+        raise HTTPException(status_code=400, detail="分批任务已完成")
+    batch.status = "running"
+    q = db.query(Execution).filter(Execution.template_id == batch.from_template_id)
+    if batch.strategy == "time_window":
+        if batch.time_window_start:
+            q = q.filter(Execution.created_at >= batch.time_window_start)
+        if batch.time_window_end:
+            q = q.filter(Execution.created_at <= batch.time_window_end)
+    q = q.filter(Execution.status != "cancelled")
+    remaining = q.offset(batch.total_processed).limit(batch.batch_size).all()
+    processed = 0
+    failed = 0
+    for exec_obj in remaining:
+        try:
+            exec_obj.template_id = batch.to_template_id
+            processed += 1
+        except Exception:
+            failed += 1
+    batch.total_processed += processed
+    batch.total_failed += failed
+    if batch.total_processed + batch.total_failed >= batch.total_target:
+        batch.status = "completed"
+    else:
+        batch.status = "paused"
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+@router.get("/migration-batches", response_model=list[MigrationBatchOut])
+def list_migration_batches(status: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
+    q = db.query(MigrationBatch)
+    if status:
+        q = q.filter(MigrationBatch.status == status)
+    return q.order_by(MigrationBatch.created_at.desc()).limit(limit).all()
+
+
+@router.get("/migration-batches/{batch_id}", response_model=MigrationBatchOut)
+def get_migration_batch(batch_id: int, db: Session = Depends(get_db)):
+    batch = db.query(MigrationBatch).filter(MigrationBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="分批任务不存在")
+    return batch
 
 
 @router.get("/{template_id}", response_model=TemplateOut)

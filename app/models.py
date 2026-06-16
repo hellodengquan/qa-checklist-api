@@ -88,6 +88,10 @@ class Execution(Base):
     terminated_at = Column(DateTime, nullable=True)
     terminate_reason = Column(Text, default="")
     last_revision_id = Column(Integer, nullable=True)
+    dead_letter_flag = Column(Integer, default=0)
+    dead_letter_reason = Column(Text, default="")
+    dead_letter_at = Column(DateTime, nullable=True)
+    archive_snapshot = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -138,6 +142,11 @@ class ScoreRevision(Base):
     reason = Column(Text, default="")
     revision_group = Column(String(50), default="")
     snapshot = Column(JSON, nullable=True)
+    replay_token = Column(String(50), default="")
+    replayed_by = Column(String(100), default="")
+    replayed_at = Column(DateTime, nullable=True)
+    replay_status = Column(String(20), default="pending")
+    version_stamp = Column(Integer, default=0)
 
     execution_item = relationship("ExecutionItem", back_populates="score_revisions")
 
@@ -222,6 +231,10 @@ class RectificationTransfer(Base):
     approval_comment = Column(Text, default="")
     requested_by = Column(String(100), default="")
     requested_at = Column(DateTime, default=datetime.utcnow)
+    approval_mode = Column(String(20), default="serial")
+    required_approvers = Column(String(500), default="")
+    current_approver_index = Column(Integer, default=0)
+    approval_chain_status = Column(String(20), default="idle")
 
     rectification = relationship("Rectification", back_populates="transfers", foreign_keys=[rectification_id])
 
@@ -312,3 +325,112 @@ def generate_batch_no(prefix: str = "QA", product_line_id: int = 0) -> str:
     now = datetime.utcnow()
     short_uuid = uuid.uuid4().hex[:8]
     return f"{prefix}-{now.strftime('%Y%m%d%H%M%S')}-{product_line_id}-{short_uuid}"
+
+
+class ReplayLock(Base):
+    __tablename__ = "replay_locks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    execution_id = Column(Integer, ForeignKey("executions.id"), nullable=False, index=True)
+    replay_token = Column(String(50), unique=True, nullable=False, index=True)
+    revision_ids = Column(String(500), default="")
+    revision_group = Column(String(50), default="")
+    held_by = Column(String(100), nullable=False)
+    held_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+    status = Column(String(20), default="active")
+
+
+class TransferApprovalChain(Base):
+    __tablename__ = "transfer_approval_chains"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transfer_id = Column(Integer, ForeignKey("rectification_transfers.id"), nullable=False, index=True)
+    approver = Column(String(100), nullable=False, index=True)
+    step_index = Column(Integer, default=0)
+    decision = Column(String(20), default="pending")
+    comment = Column(Text, default="")
+    decided_at = Column(DateTime, nullable=True)
+
+
+class DeadLetterArchive(Base):
+    __tablename__ = "dead_letter_archives"
+
+    id = Column(Integer, primary_key=True, index=True)
+    execution_id = Column(Integer, ForeignKey("executions.id"), nullable=False, index=True)
+    batch_no = Column(String(150), default="")
+    original_status = Column(String(20), default="")
+    dead_letter_reason = Column(Text, default="")
+    archived_by = Column(String(100), default="")
+    snapshot = Column(JSON, nullable=True)
+    archived_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class NCThresholdTuning(Base):
+    __tablename__ = "nc_threshold_tunings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_line_id = Column(Integer, ForeignKey("product_lines.id"), nullable=True, index=True)
+    severity = Column(String(20), default="minor")
+    trigger_type = Column(String(30), default="overdue_days")
+    current_value = Column(Float, default=0)
+    recommended_value = Column(Float, default=0)
+    confidence = Column(Float, default=0)
+    sample_size = Column(Integer, default=0)
+    analysis_window_days = Column(Integer, default=30)
+    analyzed_by = Column(String(100), default="")
+    analyzed_at = Column(DateTime, default=datetime.utcnow)
+    detail = Column(JSON, nullable=True)
+
+
+class MigrationBatch(Base):
+    __tablename__ = "migration_batches"
+    __table_args__ = (
+        Index("idx_mb_template_status", "from_template_id", "to_template_id", "status"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_template_id = Column(Integer, ForeignKey("checklist_templates.id"), nullable=False, index=True)
+    to_template_id = Column(Integer, ForeignKey("checklist_templates.id"), nullable=False, index=True)
+    strategy = Column(String(20), default="time_window")
+    batch_size = Column(Integer, default=100)
+    time_window_start = Column(DateTime, nullable=True)
+    time_window_end = Column(DateTime, nullable=True)
+    total_target = Column(Integer, default=0)
+    total_processed = Column(Integer, default=0)
+    total_failed = Column(Integer, default=0)
+    status = Column(String(20), default="pending")
+    created_by = Column(String(100), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RBACProfile(Base):
+    __tablename__ = "rbac_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, nullable=False, index=True)
+    description = Column(String(500), default="")
+    is_active = Column(Integer, default=0)
+    activated_by = Column(String(100), default="")
+    activated_at = Column(DateTime, nullable=True)
+    entries = Column(JSON, nullable=True)
+    created_by = Column(String(100), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class IndexStats(Base):
+    __tablename__ = "index_stats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    table_name = Column(String(100), nullable=False, index=True)
+    index_name = Column(String(100), nullable=False, index=True)
+    seq_scan = Column(Integer, default=0)
+    seq_scan_rows = Column(Integer, default=0)
+    idx_scan = Column(Integer, default=0)
+    idx_scan_rows = Column(Integer, default=0)
+    idx_size_bytes = Column(Integer, default=0)
+    sample_query = Column(Text, default="")
+    explain_plan = Column(Text, default="")
+    captured_at = Column(DateTime, default=datetime.utcnow, index=True)
+

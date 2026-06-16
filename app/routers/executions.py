@@ -7,7 +7,7 @@ from app.database import get_db
 from app.models import (
     Execution, ExecutionItem, ChecklistTemplate, TemplateItem,
     NonConformance, ScoreRevision, AuditLog, generate_batch_no,
-    NCEscalationRule,
+    NCEscalationRule, ReplayLock, DeadLetterArchive, NCThresholdTuning,
 )
 from app.schemas import (
     ExecutionCreate, ExecutionOut, ExecutionItemScore,
@@ -15,6 +15,9 @@ from app.schemas import (
     NonConformanceEscalate, ScoreModifyRequest, ScoreRevisionOut,
     ForceCompleteRequest, ReopenRequest, SuspendRequest, TerminateRequest,
     ScoreReplayRequest, NCEscalationRuleCreate, NCEscalationRuleOut,
+    ScoreReplayConcurrencyRequest, ScoreReplayConcurrencyOut,
+    DeadLetterArchiveRequest, DeadLetterArchiveOut,
+    NCThresholdTuningRequest, NCThresholdTuningOut,
 )
 
 router = APIRouter(prefix="/api/executions", tags=["执行记录"])
@@ -298,6 +301,131 @@ def auto_escalate_overdue(db: Session = Depends(get_db)):
     for nc in escalated:
         db.refresh(nc)
     return escalated
+
+
+# ============ executions 异常流转死信清理（放 /{execution_id} 之前避免路由冲突）============
+
+@router.post("/dead-letter/archive", response_model=list[DeadLetterArchiveOut])
+def archive_dead_letter_executions(data: DeadLetterArchiveRequest, db: Session = Depends(get_db)):
+    q = db.query(Execution).filter(Execution.status.in_(["cancelled", "terminated"]))
+    if data.execution_ids:
+        q = q.filter(Execution.id.in_(data.execution_ids))
+    execs = q.all()
+    archived = []
+    now = datetime.utcnow()
+    for ex in execs:
+        if ex.dead_letter_flag:
+            continue
+        snapshot = {
+            "id": ex.id, "batch_no": ex.batch_no, "status": ex.status,
+            "executor": ex.executor, "total_score": ex.total_score,
+            "max_score": ex.max_score, "created_at": ex.created_at.isoformat() if ex.created_at else None,
+            "terminate_reason": ex.terminate_reason, "suspend_reason": ex.suspend_reason,
+        }
+        archive = DeadLetterArchive(
+            execution_id=ex.id,
+            batch_no=ex.batch_no,
+            original_status=ex.status,
+            dead_letter_reason=data.reason or f"状态={ex.status} 归档清理",
+            archived_by="system",
+            snapshot=snapshot,
+            archived_at=now,
+        )
+        db.add(archive)
+        ex.dead_letter_flag = 1
+        ex.dead_letter_reason = data.reason
+        ex.dead_letter_at = now
+        ex.archive_snapshot = snapshot
+        archived.append(archive)
+    db.commit()
+    for a in archived:
+        db.refresh(a)
+    return archived
+
+
+@router.get("/dead-letter/list", response_model=list[DeadLetterArchiveOut])
+def list_dead_letter_archives(limit: int = 200, db: Session = Depends(get_db)):
+    return db.query(DeadLetterArchive).order_by(DeadLetterArchive.archived_at.desc()).limit(limit).all()
+
+
+# ============ NC 升级阈值动态调优（放 /{execution_id} 之前避免路由冲突）============
+
+@router.post("/nc-threshold/analyze", response_model=NCThresholdTuningOut)
+def analyze_nc_threshold(data: NCThresholdTuningRequest, db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    start = now - timedelta(days=data.window_days)
+    q = db.query(NonConformance).filter(NonConformance.created_at >= start)
+    if data.product_line_id:
+        q = q.join(ExecutionItem, ExecutionItem.id == NonConformance.execution_item_id) \
+             .join(Execution, Execution.id == ExecutionItem.execution_id) \
+             .filter(Execution.product_line_id == data.product_line_id)
+    q = q.filter(NonConformance.severity == data.severity)
+    samples = q.all()
+    sample_size = len(samples)
+    current_rules = db.query(NCEscalationRule).all()
+    current_rule = None
+    for r in current_rules:
+        if r.from_severity == data.severity and r.trigger_type == data.trigger_type:
+            current_rule = r
+            break
+    if not current_rule:
+        current_value = 0.0
+    else:
+        current_value = float(current_rule.trigger_value)
+    if sample_size < 5:
+        recommended_value = current_value or 3.0
+        confidence = 0.3
+    else:
+        if data.trigger_type == "recurring_count":
+            user_map: dict = {}
+            for s in samples:
+                k = s.created_by
+                user_map[k] = user_map.get(k, 0) + 1
+            counts = list(user_map.values())
+            if counts:
+                avg = sum(counts) / len(counts)
+                recommended_value = round(max(2.0, avg * 1.5), 1)
+                confidence = min(0.95, 0.4 + sample_size * 0.02)
+            else:
+                recommended_value = 3.0
+                confidence = 0.3
+        elif data.trigger_type == "overdue_days":
+            recommended_value = 5.0
+            confidence = 0.6
+        else:
+            recommended_value = current_value or 3.0
+            confidence = 0.5
+    detail = {
+        "sample_size": sample_size,
+        "current_rule_id": current_rule.id if current_rule else None,
+        "severity": data.severity,
+        "trigger_type": data.trigger_type,
+    }
+    tuning = NCThresholdTuning(
+        product_line_id=data.product_line_id,
+        severity=data.severity,
+        trigger_type=data.trigger_type,
+        current_value=current_value,
+        recommended_value=recommended_value,
+        confidence=confidence,
+        sample_size=sample_size,
+        analysis_window_days=data.window_days,
+        analyzed_by="system",
+        analyzed_at=now,
+        detail=detail,
+    )
+    db.add(tuning)
+    if data.apply_recommendation and current_rule:
+        current_rule.trigger_value = int(round(recommended_value))
+        detail["applied"] = True
+    db.commit()
+    db.refresh(tuning)
+    return tuning
+
+
+@router.get("/nc-threshold/history", response_model=list[NCThresholdTuningOut])
+def list_nc_threshold_history(limit: int = 100, db: Session = Depends(get_db)):
+    return db.query(NCThresholdTuning).order_by(NCThresholdTuning.analyzed_at.desc()).limit(limit).all()
 
 
 @router.get("/{execution_id}", response_model=ExecutionOut)
@@ -626,3 +754,63 @@ def cancel_execution(execution_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(execution)
     return execution
+
+
+# ============ ScoreRevision 回放并发隔离 ============
+
+@router.post("/{execution_id}/replay-lock", response_model=ScoreReplayConcurrencyOut)
+def acquire_replay_lock(execution_id: int, data: ScoreReplayConcurrencyRequest, db: Session = Depends(get_db)):
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    active_locks = db.query(ReplayLock).filter(
+        ReplayLock.execution_id == execution_id,
+        ReplayLock.status == "active",
+    ).all()
+    now = datetime.utcnow()
+    for lk in active_locks:
+        if lk.expires_at and lk.expires_at < now:
+            lk.status = "expired"
+        else:
+            raise HTTPException(status_code=409, detail=f"执行记录存在活跃回放锁 token={lk.replay_token}")
+    token = f"RP-{uuid.uuid4().hex[:16]}"
+    lock = ReplayLock(
+        execution_id=execution_id,
+        replay_token=token,
+        revision_ids=",".join(str(x) for x in data.revision_ids),
+        revision_group=data.revision_group,
+        held_by=data.held_by,
+        held_at=now,
+        expires_at=now + timedelta(seconds=data.ttl_seconds),
+        status="active",
+    )
+    db.add(lock)
+    db.flush()
+    if data.revision_ids:
+        for rev_id in data.revision_ids:
+            rev = db.query(ScoreRevision).filter(ScoreRevision.id == rev_id).first()
+            if rev:
+                rev.replay_token = token
+                rev.replay_status = "locked"
+                rev.version_stamp = (rev.version_stamp or 0) + 1
+    _log(db, data.held_by, "acquire_replay_lock", "execution", execution_id, token)
+    db.commit()
+    db.refresh(lock)
+    return lock
+
+
+@router.post("/{execution_id}/replay-lock/{replay_token}/release", response_model=ScoreReplayConcurrencyOut)
+def release_replay_lock(execution_id: int, replay_token: str, db: Session = Depends(get_db)):
+    lock = db.query(ReplayLock).filter(
+        ReplayLock.execution_id == execution_id,
+        ReplayLock.replay_token == replay_token,
+    ).first()
+    if not lock:
+        raise HTTPException(status_code=404, detail="回放锁不存在")
+    lock.status = "released"
+    revs = db.query(ScoreRevision).filter(ScoreRevision.replay_token == replay_token).all()
+    for rev in revs:
+        rev.replay_status = "unlocked"
+    db.commit()
+    db.refresh(lock)
+    return lock
