@@ -1,6 +1,6 @@
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Header
-from sqlalchemy import func, cast, String
+from sqlalchemy import func, cast, String, text
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import User, AuditLog, RBACMatrix, RBACProfile, IndexStats
@@ -446,7 +446,7 @@ def capture_index_stats(data: IndexStatsCaptureRequest, current_user: User = Dep
     for idx_name, sql in sample_queries.items():
         try:
             explain_sql = f"EXPLAIN QUERY PLAN {sql}"
-            rs = db.execute(explain_sql)
+            rs = db.execute(text(explain_sql))
             rows = rs.fetchall()
             plan_lines = []
             for r in rows:
